@@ -1,8 +1,8 @@
 """
-跟跑浏览器 - V1.0.2
+跟跑浏览器 - V1.0.3
 核心能力：用 Windows 原生 RegisterHotKey API 注册全局热键，
 解决 Edge/WebView2 焦点下键盘钩子容易被吞的问题。
-本版优化：清理打包依赖体积、页面加载后重复注入控制脚本、加强设置校验。
+本版优化：保存/恢复窗口位置、大小和最大化状态。
 """
 import os, sys, json, logging, queue, threading, time, subprocess
 import ctypes, ctypes.wintypes
@@ -79,6 +79,7 @@ def _logd(msg): _logger.debug(msg)
 DEFAULT_CONFIG = {
     "homepage": "https://www.bilibili.com",
     "width": 800, "height": 600,
+    "window_state": None,
     "opacity_levels": [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1],
     "show_top_bar": True, "top_bar_auto_hide": True,
     "hotkeys": {
@@ -871,6 +872,70 @@ class BrowserApp:
             return result[0]
         return None
 
+    def _get_window_placement(self):
+        """读取窗口普通位置、大小和最大化状态，用于下次启动恢复。"""
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return None
+
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long),
+            ]
+
+        class WINDOWPLACEMENT(ctypes.Structure):
+            _fields_ = [
+                ("length", ctypes.c_uint), ("flags", ctypes.c_uint),
+                ("showCmd", ctypes.c_uint), ("ptMinPosition", POINT),
+                ("ptMaxPosition", POINT), ("rcNormalPosition", RECT),
+            ]
+
+        placement = WINDOWPLACEMENT()
+        placement.length = ctypes.sizeof(WINDOWPLACEMENT)
+        if not ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(placement)):
+            return None
+        rect = placement.rcNormalPosition
+        width = max(400, rect.right - rect.left)
+        height = max(300, rect.bottom - rect.top)
+        return {
+            "x": int(rect.left), "y": int(rect.top),
+            "width": int(width), "height": int(height),
+            "maximized": placement.showCmd == 3,
+        }
+
+    def _save_window_state(self):
+        state = self._get_window_placement()
+        if not state:
+            return
+        self.config["window_state"] = state
+        self.config["width"] = state["width"]
+        self.config["height"] = state["height"]
+        self._write_config(self.config)
+        _logd(f"窗口状态已保存: {state}")
+
+    def _restore_window_state(self):
+        state = self.config.get("window_state")
+        if not isinstance(state, dict):
+            return
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return
+        try:
+            x = int(state.get("x", 100))
+            y = int(state.get("y", 100))
+            width = max(400, int(state.get("width", self.config.get("width", 800))))
+            height = max(300, int(state.get("height", self.config.get("height", 600))))
+            ctypes.windll.user32.MoveWindow(hwnd, x, y, width, height, True)
+            if state.get("maximized"):
+                ctypes.windll.user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
+            _logd(f"窗口状态已恢复: {state}")
+        except Exception as e:
+            _logd(f"_restore_window_state error: {e}")
+
     def _set_window_alpha(self, ratio):
         """设置窗口整体透明度 0.0~1.0（SetLayeredWindowAttributes）。"""
         hwnd = self._get_hwnd()
@@ -972,9 +1037,13 @@ class BrowserApp:
                 pass
         if self.window:
             try:
+                self._save_window_state()
                 self.window.destroy()
             except Exception:
                 pass
+
+    def _on_closing(self):
+        self._save_window_state()
 
     def _inject_js(self, *args):
         if not self.window:
@@ -1049,6 +1118,10 @@ class BrowserApp:
         except AttributeError:
             _log("当前 pywebview 版本不支持 new_window 事件")
         self.window.events.loaded += self._on_loaded
+        try:
+            self.window.events.closing += self._on_closing
+        except AttributeError:
+            _log("当前 pywebview 版本不支持 closing 事件")
 
         def on_start():
             # 精确认 HWND 存在（窗口刚创建，FindWindowW 立即可查到）
@@ -1062,6 +1135,7 @@ class BrowserApp:
                 _log("警告：获取 HWND 失败，非 JS 操作可能延迟")
             # HWND 就绪 → 非 JS 操作（穿透/透明度）立即可用
             self._window_ready = True
+            self._restore_window_state()
             try:
                 self.window.on_top = True
             except Exception as e:
@@ -1549,6 +1623,7 @@ def _save_settings(win, gen_vars, hk_recorders, app, on_close_callback):
         "homepage":       gen_vars["homepage"].get().strip() or DEFAULT_CONFIG["homepage"],
         "width":          width,
         "height":         height,
+        "window_state":   app.config.get("window_state"),
         "opacity_levels": opacity_levels,
         "show_top_bar":      bool(gen_vars["show_top_bar"].get()),
         "top_bar_auto_hide":  bool(gen_vars["top_bar_auto_hide"].get()),

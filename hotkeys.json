@@ -1,0 +1,33 @@
+{
+  "homepage": "https://www.bilibili.com",
+  "width": 800,
+  "height": 600,
+  "opacity_levels": [
+    1.0,
+    0.9,
+    0.8,
+    0.7,
+    0.6,
+    0.5,
+    0.4,
+    0.3,
+    0.2,
+    0.1
+  ],
+  "show_top_bar": true,
+  "top_bar_auto_hide": true,
+  "hotkeys": {
+    "play_pause": "ctrl+space",
+    "seek_forward": "ctrl+right",
+    "seek_backward": "ctrl+left",
+    "adjust_opacity_up": "ctrl+up",
+    "adjust_opacity_down": "ctrl+down",
+    "show_settings": "home",
+    "speed_up": "ctrl++",
+    "speed_down": "ctrl+-",
+    "speed_reset": "ctrl+0",
+    "browser_back": "ctrl+backspace",
+    "toggle_top_bar": "insert",
+    "toggle_click_through": "ctrl+t"
+  }
+}

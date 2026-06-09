@@ -1,7 +1,8 @@
 """
-跟跑浏览器 - V1.0.0
-核心修复：用 Windows 原生 RegisterHotKey API 替换 pynput，
-彻底解决 Edge/WebView2 焦点下键盘钩子被吞的问题。
+跟跑浏览器 - V1.0.2
+核心能力：用 Windows 原生 RegisterHotKey API 注册全局热键，
+解决 Edge/WebView2 焦点下键盘钩子容易被吞的问题。
+本版优化：清理打包依赖体积、页面加载后重复注入控制脚本、加强设置校验。
 """
 import os, sys, json, logging, queue, threading, time, subprocess
 import ctypes, ctypes.wintypes

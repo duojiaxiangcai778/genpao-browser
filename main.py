@@ -1,21 +1,76 @@
-"""
-跟跑浏览器 - V1.0.3
+"""跟跑浏览器 - V1.0.6
 核心能力：用 Windows 原生 RegisterHotKey API 注册全局热键，
 解决 Edge/WebView2 焦点下键盘钩子容易被吞的问题。
-本版优化：保存/恢复窗口位置、大小和最大化状态。
-"""
-import os, sys, json, logging, queue, threading, time, subprocess
-import ctypes, ctypes.wintypes
+V1.0.4 优化：修复首次打开崩溃卡死问题（WebView2 异常保护+多实例互斥锁+原子写入）。
+V1.0.5 重构：WebView2 缓存目录前置到 %LOCALAPPDATA%（exe 黑屏修复）、移除强制 GPU
+参数（交给 WebView2 按显卡自动降级）、private_mode=False（关闭崩溃/登录持久化）。
+V1.0.6 修复：首次启动（window_state 为空）时窗口从未收到尺寸变化，WebView2 渲染表面
+停在创建时的旧尺寸 → 整窗只剩背景色的"白屏"（页面其实已加载）。现在无论有无保存状态
+都会应用一次窗口几何，尺寸未变则抖动 2px 强制刷新；并把 pywebview 自身日志接入
+debug.log（此前只写 stderr，打包后白屏没有任何线索）。"""
+# ---- 环境初始化：必须在 import webview 之前执行（exe 打包黑屏修复）----
+import os
+import sys
+
+# 1. 强制重定向 WebView2 用户数据目录到 AppData，
+#    绕过 PyInstaller 解压临时目录（sys._MEIPASS）的权限黑洞
+_WB2_DATA_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+    "GenPaoBrowser_Data",
+)
+try:
+    os.makedirs(_WB2_DATA_DIR, exist_ok=True)
+except Exception:
+    pass
+os.environ["WEBVIEW2_USER_DATA_FOLDER"] = _WB2_DATA_DIR
+
+# 2. 移除强制 GPU 光栅化/硬件解码参数：部分显卡驱动下会导致
+#    exe 内 WebView2 渲染进程挂起 → 黑屏。交给 WebView2 自动降级。
+os.environ.pop("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", None)
+
+# 3. 固定使用 EdgeChromium 后端
+os.environ["PYWEBVIEW_GUI"] = "edgechromium"
+
+# ---- 以下为标准库导入 ----
+import ctypes
+import ctypes.wintypes
+import json
+import logging
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox, ttk
 
 # win32 常量（避免额外依赖 pywin32）
 WM_HOTKEY    = 0x0312
+MB_OK               = 0x00000000
+MB_OKCANCEL         = 0x00000001
+MB_YESNO            = 0x00000004
+MB_ICONERROR        = 0x00000010
+MB_ICONQUESTION     = 0x00000020
+MB_ICONWARNING      = 0x00000030
+MB_ICONINFORMATION  = 0x00000040
+MB_TOPMOST          = 0x00040000
+
+
+def _messagebox_w(title, text, style=MB_OK | MB_ICONINFORMATION | MB_TOPMOST):
+    """Win32 MessageBoxW — 不依赖 tkinter，可在主入口安全使用。"""
+    return ctypes.windll.user32.MessageBoxW(None, text, title, style)
+
+
 MOD_ALT      = 0x0001
 MOD_CONTROL  = 0x0002
 MOD_SHIFT    = 0x0004
 MOD_WIN      = 0x0008
 WS_EX_TRANSPARENT = 0x00000020
+
+# 与主窗口共享"跟跑助手"字样的辅助窗口标题特征（设置/等待/无响应弹窗），
+# 按标题取主窗口 HWND 时必须排除它们
+_AUX_WINDOW_TITLE_MARKS = ("设置", "等待中", "无响应")
 
 # 虚拟键码映射：配置键名 -> Windows VK_* 值
 VK_MAP = {
@@ -51,17 +106,21 @@ def _is_frozen():
 
 _APP_DIR = os.path.dirname(sys.executable if _is_frozen() else __file__)
 
+
 try:
     import webview as pywebview
-    from pynput import keyboard   # 仅 HotkeyRecorder 使用
-except ImportError:
-    r = tk.Tk(); r.withdraw()
-    messagebox.showerror("环境缺失", "缺少必要依赖")
-    r.destroy(); sys.exit()
-
-pywebview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = False
+    from pynput import keyboard  # 仅 HotkeyRecorder 使用
+except ImportError as _ie:
+    import traceback
+    _err_path = os.path.join(os.path.dirname(sys.executable if getattr(sys, "frozen", False) else __file__), "debug.log")
+    with open(_err_path, "a", encoding="utf-8") as _f:
+        _f.write(f"[{time.strftime('%H:%M:%S')}] FATAL: 缺少必要依赖: {_ie}\n")
+        _f.write(traceback.format_exc() + "\n")
+    _messagebox_w("环境缺失", f"缺少必要依赖: {_ie}\n\n请确保已安装所有依赖。", MB_OK | MB_ICONERROR | MB_TOPMOST)
+    sys.exit(1)
 
 LOG_PATH = os.path.join(_APP_DIR, "debug.log")
+_config_write_lock = threading.Lock()  # 配置写入互斥锁
 _logger = logging.getLogger("跟跑浏览器")
 _logger.setLevel(logging.DEBUG)
 if not _logger.handlers:
@@ -73,13 +132,21 @@ if not _logger.handlers:
     fh.setFormatter(fmt); sh.setFormatter(fmt)
     _logger.addHandler(fh); _logger.addHandler(sh)
 
+    # pywebview 自身的日志（WebView2 初始化失败、导航/渲染异常等）过去只写
+    # stderr，打包成窗口程序后 stderr 无处可去 → 出白屏时 debug.log 里一条
+    # 线索都没有。这里复用同一个 FileHandler 接进来（不能各开一个句柄，
+    # 两个文件对象各持写入位置会互相覆盖日志内容）。
+    _pw_logger = logging.getLogger("pywebview")
+    _pw_logger.setLevel(logging.DEBUG)
+    _pw_logger.addHandler(fh)
+
 def _log(msg): _logger.info(msg)
 def _logd(msg): _logger.debug(msg)
-
 DEFAULT_CONFIG = {
     "homepage": "https://www.bilibili.com",
-    "width": 800, "height": 600,
+    "width": 1280, "height": 720,   # 默认 16:9
     "window_state": None,
+    "lock_aspect_ratio": True,      # 拖动窗口时锁定 16:9 比例
     "opacity_levels": [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1],
     "show_top_bar": True, "top_bar_auto_hide": True,
     "hotkeys": {
@@ -109,6 +176,7 @@ class RegisterHotkeyManager:
     def __init__(self):
         self.user32     = ctypes.windll.user32
         self._callbacks = {}   # {hotkey_id: (action_name, combo_str, app_ref_fn)}
+        self._cb_lock = threading.Lock()  # _callbacks 线程安全锁
         self._next_id   = 1
         self._running   = False
         self._thread    = None
@@ -164,9 +232,10 @@ class RegisterHotkeyManager:
             _logd(f"热键无法注册（格式不支持）: {combo!r} ({action_name})")
             return
         mods, vk = parsed
-        self._callbacks[hotkey_id] = (action_name, combo, app_ref_fn)
         ok = self.user32.RegisterHotKey(None, hotkey_id, mods, vk)
         if ok:
+            with self._cb_lock:
+                self._callbacks[hotkey_id] = (action_name, combo, app_ref_fn)
             _logd(f"注册热键: {combo!r} -> id={hotkey_id} ({action_name})")
         else:
             _log(f"热键注册失败（可能被占用）: {combo!r} ({action_name})")
@@ -186,9 +255,10 @@ class RegisterHotkeyManager:
 
     def stop(self):
         self._running = False
-        for hid in list(self._callbacks.keys()):
-            self.user32.UnregisterHotKey(None, hid)
-        self._callbacks.clear()
+        with self._cb_lock:
+            for hid in list(self._callbacks.keys()):
+                self.user32.UnregisterHotKey(None, hid)
+            self._callbacks.clear()
         # 发送 WM_QUIT 让 GetMessageA 返回 0，线程正常退出
         if self._thread and self._thread.ident and self._thread.is_alive():
             WM_QUIT = 0x0012
@@ -214,8 +284,10 @@ class RegisterHotkeyManager:
                 continue
             if msg.message == WM_HOTKEY:
                 hid = msg.wParam
-                if hid in self._callbacks:
-                    action_name, combo, app_ref_fn = self._callbacks[hid]
+                with self._cb_lock:
+                    cb_info = self._callbacks.get(hid)
+                if cb_info:
+                    action_name, combo, app_ref_fn = cb_info
                     self._dispatch(action_name, combo, app_ref_fn)
             elif msg.message == 0x0012:  # WM_QUIT
                 break
@@ -270,11 +342,16 @@ class BrowserApp:
         self._last_bar_inject = 0
         self._bar_visible = False     # 横条显隐状态
         self._seek_accum = 0          # 快进/退累计偏移（毫秒合并用）
-        self._seek_timer = None       # 合并定时器
+        self._seek_flush_scheduled = None  # 下次刷新时间（time.time）
         self._click_through = False   # 鼠标穿透状态
         self._pending_actions = []    # 窗口就绪前缓存的热键动作
+        self._pending_lock = threading.Lock()  # pending_actions 线程安全锁
         self._window_ready = False    # WebView2 窗口是否已就绪
         self._hwnd = None             # 缓存窗口句柄，避免每次 FindWindowW
+        # 16:9 比例锁定状态（resized 事件 + 防抖校正实现，不碰 Win32 WndProc）
+        self._lock_ratio = bool(self.config.get("lock_aspect_ratio", True))
+        self._fix_timer = None        # 16:9 校正防抖定时器
+        self._pending_size = None     # 待校正的 (width, height)
 
     def _load_config(self):
         if not os.path.exists(self.CONFIG_FILE):
@@ -306,11 +383,18 @@ class BrowserApp:
             return json.loads(json.dumps(DEFAULT_CONFIG))
 
     def _write_config(self, cfg):
-        try:
-            with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
+        """原子写入配置文件：先写临时文件再重命名，防止崩溃导致文件损坏。"""
+        with _config_write_lock:
+            tmp_path = self.CONFIG_FILE + ".tmp"
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, indent=2, ensure_ascii=False)
+                os.replace(tmp_path, self.CONFIG_FILE)
+            except Exception:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
     def _apply_config(self, new_cfg):
         global _hotkey_manager
@@ -319,6 +403,11 @@ class BrowserApp:
         self.opacity_levels = new_cfg.get("opacity_levels", DEFAULT_CONFIG["opacity_levels"])
         self.opacity_index = 0
         self.current_opacity = self.opacity_levels[0]
+        # 同步 16:9 比例锁定开关；从关闭切到开启时，立即把窗口调整为 16:9
+        was_locked = self._lock_ratio
+        self._lock_ratio = bool(new_cfg.get("lock_aspect_ratio", True))
+        if self._lock_ratio and not was_locked:
+            self._fit_ratio_now()
         if _hotkey_manager:
             old_mgr = _hotkey_manager
             old_mgr.stop()
@@ -457,6 +546,12 @@ class BrowserApp:
         if now - self._last_bar_inject < 1.0:
             return
         self._last_bar_inject = now
+
+        # 因为当前是由 _on_loaded 事件触发注入，说明 DOM 已绝对就绪
+        # 直接检查 _window_ready 标志即可，不需要循环等待
+        if not self._window_ready:
+            return
+
         hk_cfg     = self.config.get("hotkeys", {})
         auto_hide  = self.config.get("top_bar_auto_hide", True)
 
@@ -513,7 +608,7 @@ class BrowserApp:
             if auto_hide else ""
         )
 
-        js = f"""(function(){{
+        js = rf"""(function(){{
             function inject(){{
                 if(!document.body){{setTimeout(inject,100);return;}}
                 // 清理旧元素
@@ -633,7 +728,8 @@ class BrowserApp:
                        "speed_up", "speed_down", "speed_reset",
                        "browser_back", "toggle_top_bar"):
             if not self.window or not self._window_ready:
-                self._pending_actions.append(action)
+                with self._pending_lock:
+                    self._pending_actions.append(action)
                 _logd(f"热键缓存（JS 未就绪）: {action}")
                 return
 
@@ -641,19 +737,17 @@ class BrowserApp:
         elif action in ("adjust_opacity_up", "adjust_opacity_down",
                         "toggle_click_through"):
             if not hwnd:
-                self._pending_actions.append(action)
+                with self._pending_lock:
+                    self._pending_actions.append(action)
                 _logd(f"热键缓存（HWND 未就绪）: {action}")
                 return
             # HWND 存在 → 立即执行，不依赖窗口就绪标志
 
-        # 快进/退：高频合并
+        # 快进/退：高频合并（通过 tkinter 线程调度，避免在 Timer 线程调 evaluate_js）
         if action in ("seek_forward", "seek_backward"):
             delta = 5 if action == "seek_forward" else -5
             self._seek_accum += delta
-            if self._seek_timer:
-                self._seek_timer.cancel()
-            self._seek_timer = threading.Timer(0.1, self._flush_seek)
-            self._seek_timer.start()
+            self._seek_flush_scheduled = time.time() + 0.1
             return
 
         # 播放/暂停：节流 150ms
@@ -672,6 +766,12 @@ class BrowserApp:
 
         try:
             if action == "open_settings":
+                # 重复触发保护：设置窗口已打开时直接忽略，避免连点按钮/重复热键
+                # 导致队列里堆两份 open_settings，第二次在 _build_settings 尚未把
+                # settings_win 赋值前被 tkinter 线程取出，从而再建一个空白窗口。
+                if self.is_settings_opened:
+                    _logd("设置窗口已打开，忽略重复 open_settings")
+                    return
                 self.is_settings_opened = True
             elif action == "close_settings":
                 self.is_settings_opened = False
@@ -706,9 +806,11 @@ class BrowserApp:
         """将累计的快进/退偏移一次性应用到视频。"""
         if not self.window or self._seek_accum == 0:
             self._seek_accum = 0
+            self._seek_flush_scheduled = None
             return
         offset = self._seek_accum
         self._seek_accum = 0
+        self._seek_flush_scheduled = None
         js = f"""(function(){{
             var vs=document.querySelectorAll('video');if(!vs.length)return;
             var v=Array.from(vs).sort(function(a,b){{
@@ -795,7 +897,7 @@ class BrowserApp:
         if not self.window:
             return
         oid = "_gtosd"
-        esc_text = text.replace("'", "\\'").replace("\\", "\\\\")
+        esc_text = json.dumps(text)[1:-1]  # JSON 安全编码，自动转义引号/换行/反斜杠
         js = f"""(function(){{
             var o=document.getElementById('{oid}');
             if(!o){{o=document.createElement('div');o.id='{oid}';
@@ -855,7 +957,11 @@ class BrowserApp:
                 return hwnd
         except Exception:
             pass
-        # 方式4：EnumWindows 枚举所有窗口模糊匹配
+        # 方式4：EnumWindows 枚举所有窗口模糊匹配。
+        # 注意必须排除自身辅助窗口："跟跑助手 · 设置" / "跟跑助手 - 等待中"
+        # / "跟跑助手 - 无响应" 都含"跟跑助手"，一旦被认成主窗口，
+        # 透明度、鼠标穿透、窗口几何都会打到错误的窗口上。
+        # 多个候选时取面积最大的（主窗口），避免 result[0] 的随机性。
         result = []
         EnumWindowsProc = ctypes.WINFUNCTYPE(
             ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
@@ -863,13 +969,17 @@ class BrowserApp:
         def cb(hwnd, _):
             buf = ctypes.create_unicode_buffer(256)
             ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
-            if "跟跑助手" in buf.value:
-                result.append(hwnd)
+            title = buf.value
+            if "跟跑助手" in title and not any(m in title for m in _AUX_WINDOW_TITLE_MARKS):
+                rect = self._get_window_rect(hwnd)
+                area = (rect[2] * rect[3]) if rect else 0
+                result.append((area, hwnd))
             return True
         ctypes.windll.user32.EnumWindows(EnumWindowsProc(cb), 0)
         if result:
-            self._hwnd = result[0]
-            return result[0]
+            result.sort(reverse=True)
+            self._hwnd = result[0][1]
+            return self._hwnd
         return None
 
     def _get_window_placement(self):
@@ -917,24 +1027,147 @@ class BrowserApp:
         self._write_config(self.config)
         _logd(f"窗口状态已保存: {state}")
 
+    def _get_window_rect(self, hwnd):
+        """返回窗口当前 (x, y, width, height)，失败返回 None。"""
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long),
+            ]
+        rect = RECT()
+        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        return (int(rect.left), int(rect.top),
+                int(rect.right - rect.left), int(rect.bottom - rect.top))
+
     def _restore_window_state(self):
-        state = self.config.get("window_state")
-        if not isinstance(state, dict):
-            return
+        """应用窗口几何，并保证 WebView2 收到一次真实的尺寸变化。
+
+        为什么"没有保存状态也要动一次窗口"：WebView2 的渲染表面是跟随窗口
+        尺寸建立的，若窗口显示后从未收到过尺寸变化，表面会停在创建时的旧
+        尺寸，整窗只剩默认底色（白屏），而页面其实已加载、JS 与热键都正常，
+        表现出来就是"白屏卡死"。window_state 为空（首次启动、配置被重置）
+        恰好会跳过这一步，所以首次打开最容易白屏。因此这里不再提前 return：
+        没有保存状态就沿用当前位置与配置尺寸，尺寸确实没变时额外做一次
+        2px 抖动，强制 WebView2 重建渲染表面。
+        """
         hwnd = self._get_hwnd()
         if not hwnd:
             return
+        state = self.config.get("window_state")
         try:
-            x = int(state.get("x", 100))
-            y = int(state.get("y", 100))
-            width = max(400, int(state.get("width", self.config.get("width", 800))))
-            height = max(300, int(state.get("height", self.config.get("height", 600))))
+            cur = self._get_window_rect(hwnd)
+            if isinstance(state, dict):
+                x = int(state.get("x", cur[0] if cur else 100))
+                y = int(state.get("y", cur[1] if cur else 100))
+                width = max(400, int(state.get("width", self.config.get("width", 1280))))
+                height = max(300, int(state.get("height", self.config.get("height", 720))))
+                maximized = bool(state.get("maximized"))
+            else:
+                # 首次启动：保持当前位置，套用配置里的默认尺寸
+                x, y = (cur[0], cur[1]) if cur else (100, 100)
+                width = max(400, int(self.config.get("width", DEFAULT_CONFIG["width"])))
+                height = max(300, int(self.config.get("height", DEFAULT_CONFIG["height"])))
+                maximized = False
+                _logd("无窗口状态（首次启动），按默认尺寸应用几何")
+            if self._lock_ratio and not maximized:
+                width, height = self._ratio_size(width, height)
             ctypes.windll.user32.MoveWindow(hwnd, x, y, width, height, True)
-            if state.get("maximized"):
+            if cur and (width, height) == (cur[2], cur[3]):
+                # 尺寸没变时 WebView2 不会重建渲染表面，抖动 2px 强制刷新
+                ctypes.windll.user32.MoveWindow(hwnd, x, y, width, height + 2, True)
+                ctypes.windll.user32.MoveWindow(hwnd, x, y, width, height, True)
+                _logd("窗口尺寸未变化，已做 2px 抖动以强制刷新 WebView2 表面")
+            if maximized:
                 ctypes.windll.user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
-            _logd(f"窗口状态已恢复: {state}")
+            _logd(f"窗口几何已应用: x={x} y={y} {width}x{height}"
+                  + (f"（按16:9修正）" if self._lock_ratio and not maximized else ""))
         except Exception as e:
             _logd(f"_restore_window_state error: {e}")
+
+    # ---- 16:9 比例锁定（resized 事件校正法，不碰 Win32 WndProc） ----
+
+    def _ratio_size(self, w, h):
+        """把窗口尺寸修正为 16:9（以宽为基准），最小不低于 533x300。
+
+        533x300 是 16:9 且满足原窗口 400x300 下限的最小尺寸。
+        """
+        MINW, MINH = 533, 300
+        RATIO = 16.0 / 9.0
+        w = max(int(w), MINW)
+        nh = int(round(w / RATIO))
+        if nh < MINH:
+            nh = MINH
+            w = int(round(nh * RATIO))
+        return w, nh
+
+    def _on_window_resized(self, width, height):
+        """窗口尺寸变化后，防抖 300ms 再按 16:9 校正（安全方案）。
+
+        不实时校正（resize 会再触发 resized 形成高频振荡），而是：
+        每次 resized 记录最新尺寸并重置定时器 → 用户停止拖动 300ms 后
+        校正一次，实现"松手吸附 16:9"。全程用 Win32 MoveWindow（线程安全），
+        完全不碰 WndProc 消息链，WebView2 渲染不受影响。
+        """
+        if not self._lock_ratio or not self.window:
+            return
+        self._pending_size = (int(width), int(height))
+        if self._fix_timer:
+            try:
+                self._fix_timer.cancel()
+            except Exception:
+                pass
+        self._fix_timer = threading.Timer(0.3, self._do_fix_ratio)
+        self._fix_timer.daemon = True
+        self._fix_timer.start()
+
+    def _do_fix_ratio(self):
+        """防抖到期后执行校正。Timer 线程调用，只用 Win32 API（线程安全）。"""
+        if not self._lock_ratio or not self.window:
+            return
+        try:
+            w, h = self._pending_size or (0, 0)
+            expected_h = int(round(w * 9 / 16))
+            if abs(h - expected_h) <= 3 or expected_h < 300:
+                return  # 已在 16:9 容差内
+            hwnd = self._get_hwnd()
+            if not hwnd:
+                return
+            if ctypes.windll.user32.IsZoomed(hwnd):
+                return  # 最大化不校正
+            class _R(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                            ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+            rect = _R()
+            if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return
+            ctypes.windll.user32.MoveWindow(
+                hwnd, rect.left, rect.top, w, expected_h, True
+            )
+            _log(f"16:9 校正(松手吸附): {w}x{h} -> {w}x{expected_h}")
+        except Exception as e:
+            _logd(f"_do_fix_ratio error: {e}")
+
+    def _fit_ratio_now(self):
+        """把当前窗口立即调整为 16:9（保留左上角位置；最大化时不处理）。"""
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return
+        user32 = ctypes.windll.user32
+        class _R(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+        rect = _R()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return
+        if user32.IsZoomed(hwnd):
+            return  # 最大化状态不调整
+        w = rect.right - rect.left
+        h = rect.bottom - rect.top
+        nw, nh = self._ratio_size(w, h)
+        if (nw, nh) != (w, h):
+            user32.MoveWindow(hwnd, rect.left, rect.top, nw, nh, True)
+            _log(f"已按 16:9 调整当前窗口: {w}x{h} -> {nw}x{nh}")
 
     def _set_window_alpha(self, ratio):
         """设置窗口整体透明度 0.0~1.0（SetLayeredWindowAttributes）。"""
@@ -1029,6 +1262,8 @@ class BrowserApp:
 
     def _quit(self):
         self._shutting_down = True
+        self._seek_accum = 0
+        self._seek_flush_scheduled = None
         global _hotkey_manager
         if _hotkey_manager:
             try:
@@ -1092,78 +1327,183 @@ class BrowserApp:
 
     def _on_loaded(self):
         """页面加载完成后重新注入横条。"""
+        if hasattr(self, '_page_timer') and self._page_timer:
+            self._page_timer.cancel()
+            self._page_timer = None
+
+        # 此时页面已经是主页，直接注入即可
         self._inject_js()
         self._inject_bar()
+        _logd("页面加载完成，横条已重新注入")
 
     def start(self):
         data_dir = self.get_data_dir()
         if not os.path.exists(data_dir):
             os.makedirs(data_dir)
-        os.environ["PYWEBVIEW_GUI"] = "edgechromium"
-        os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = \
-            "--ignore-gpu-blocklist --enable-gpu-rasterization --enable-hw-video-decode"
-        os.environ["WEBVIEW2_USER_DATA_FOLDER"] = data_dir
-        _log(f"WebView2 数据目录: {data_dir}")
+        # 注：WEBVIEW2_USER_DATA_FOLDER 已在模块顶部（import webview 之前）
+        # 统一指向 %LOCALAPPDATA%\GenPaoBrowser_Data，这里不再覆盖；
+        # 也不再加 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS 强制 GPU 加速
+        # （部分显卡驱动下会导致 exe 内 WebView2 渲染挂起 → 黑屏）。
+        _log(f"WebView2 数据目录: {os.environ.get('WEBVIEW2_USER_DATA_FOLDER')}")
 
         js_api = JsApi()
-        self.window = pywebview.create_window(
-            "跟跑助手", self.config.get("homepage"),
-            width=self.config.get("width", 800),
-            height=self.config.get("height", 600),
-            min_size=(400, 300),
-            js_api=js_api,
-        )
+        try:
+            # 直接获取主页 URL
+            _homepage = self.config.get("homepage", DEFAULT_CONFIG["homepage"])
+
+            # 默认窗口尺寸：无保存状态且锁定比例时，按 16:9 兜底
+            _init_w = int(self.config.get("width", DEFAULT_CONFIG["width"]))
+            _init_h = int(self.config.get("height", DEFAULT_CONFIG["height"]))
+            if self._lock_ratio and not self.config.get("window_state"):
+                _init_w, _init_h = self._ratio_size(_init_w, _init_h)
+
+            # 直接传入目标网址，使用深色背景替代加载页（防止白屏闪烁）
+            self.window = pywebview.create_window(
+                "跟跑助手",
+                url=_homepage,              # 直接传入目标网址
+                background_color='#1e1e2e', # 设置深色背景，防止白屏闪烁
+                width=_init_w,
+                height=_init_h,
+                min_size=(400, 300),
+                on_top=True,                # 置顶：构造参数在 Form 初始化(GUI线程)设 TopMost，安全且持久
+                js_api=js_api,
+            )
+        except Exception as e:
+            _log(f"创建 WebView2 窗口失败: {e}")
+            _messagebox_w("启动失败",
+                f"无法创建 WebView2 窗口。\n请确保已安装 WebView2 Runtime。\n\n错误: {e}",
+                MB_OK | MB_ICONERROR | MB_TOPMOST)
+            sys.exit(1)
         try:
             self.window.events.new_window += self._on_new_window
         except AttributeError:
             _log("当前 pywebview 版本不支持 new_window 事件")
         self.window.events.loaded += self._on_loaded
         try:
+            # 16:9 锁比：监听窗口尺寸变化后校正（安全方案，不碰 WndProc）
+            self.window.events.resized += self._on_window_resized
+        except AttributeError:
+            _log("当前 pywebview 版本不支持 resized 事件，16:9 拖动锁比不可用")
+        try:
             self.window.events.closing += self._on_closing
         except AttributeError:
             _log("当前 pywebview 版本不支持 closing 事件")
 
+        # 绑定 shown 事件：强制任务栏显示图标
+        def _on_shown():
+            """窗口显示后，强制在任务栏显示图标（解决无边框窗口不显示任务栏的问题）"""
+            _log("窗口 shown 事件触发，尝试强制任务栏显示")
+            try:
+                hwnd = self._get_hwnd()
+                if hwnd:
+                    user32 = ctypes.windll.user32
+                    GWL_EXSTYLE = -20
+                    WS_EX_APPWINDOW = 0x00040000
+                    WS_EX_TOOLWINDOW = 0x00000080
+
+                    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                    # 移除 ToolWindow，添加 AppWindow
+                    style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+                    user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+
+                    # 修改扩展样式后，必须调用 SetWindowPos 触发重绘（FRAMECHANGED），否则WebView2必定白屏或假死
+                    user32.SetWindowPos(
+                        hwnd, 0, 0, 0, 0, 0,
+                        0x0001 | 0x0002 | 0x0004 | 0x0020  # NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED
+                    )
+                    _log("已强制添加 WS_EX_APPWINDOW 样式并刷新帧，任务栏应显示图标")
+            except Exception as e:
+                _logd(f"强制任务栏显示失败: {e}")
+
+        try:
+            self.window.events.shown += _on_shown
+        except AttributeError:
+            _log("当前 pywebview 版本不支持 shown 事件")
+
+        _start_timeout = [None]  # 闭包可写引用
+
+        def _on_start_timeout():
+            """pywebview.start 超过 20 秒仍未调用 on_start → 白屏超时保护"""
+            _log("启动超时：WebView2 窗口初始化超过 20 秒")
+            _messagebox_w("启动超时",
+                "跟跑助手启动时间过长。\n\n"
+                "可能原因：\n"
+                "1. WebView2 Runtime 未安装或损坏\n"
+                "2. 网络连接问题\n"
+                "3. 系统资源不足\n\n"
+                "请检查后重试。",
+                MB_OK | MB_ICONWARNING | MB_TOPMOST)
+            os._exit(1)
+
         def on_start():
-            # 精确认 HWND 存在（窗口刚创建，FindWindowW 立即可查到）
-            for attempt in range(5):
+            # 取消启动超时定时器
+            if _start_timeout[0]:
+                _start_timeout[0].cancel()
+                _start_timeout[0] = None
+
+            _log("on_start 回调已触发")
+
+            # 等待 HWND 出现（最多 2 秒）
+            hwnd = None
+            for attempt in range(20):  # 20 * 100ms = 2s
                 hwnd = self._get_hwnd()
                 if hwnd:
                     _log(f"窗口 HWND 已获取: 0x{hwnd:X}（尝试 {attempt+1} 次）")
                     break
-                time.sleep(0.02)
-            else:
-                _log("警告：获取 HWND 失败，非 JS 操作可能延迟")
-            # HWND 就绪 → 非 JS 操作（穿透/透明度）立即可用
+                time.sleep(0.1)
+
+            if not hwnd:
+                _log("警告：获取 HWND 失败，但继续运行（依赖 loaded 事件）")
+
+            # 标记窗口就绪（非 JS 操作可用）
             self._window_ready = True
+            _log("窗口已就绪 (_window_ready = True)")
+
+            # 恢复窗口状态（锁定比例开启时按 16:9 修正尺寸）
             self._restore_window_state()
-            try:
-                self.window.on_top = True
-            except Exception as e:
-                _logd(f"设置 on_top 失败: {e}")
-            # 立即重放缓存中的非 JS 操作（穿透/透明度）
-            pending = self._pending_actions[:]
-            self._pending_actions.clear()
+
+            # 置顶：已通过 create_window(on_top=True) 在 Form 初始化(GUI线程)设置，
+            # 这里不再用 Win32 SetWindowPos 或 window.on_top（后者跨线程会死锁，
+            # 前者设置的 WS_EX_TOPMOST 会被 .NET 按 TopMost=False 清掉）。
+
+            # 重放缓存中的非 JS 操作（穿透/透明度）
+            with self._pending_lock:
+                pending = self._pending_actions[:]
+                self._pending_actions.clear()
             for action in pending:
                 if action in ("adjust_opacity_up", "adjust_opacity_down",
                               "toggle_click_through"):
-                    _log(f"快速重放（HWND 已就绪）: {action}")
+                    _log(f"重放（HWND 就绪）: {action}")
                     self._dispatch(action)
-            # JS 注入（视频控制类操作需要）
-            try:
-                self._inject_bar()
-                _log("JS 注入完成，所有热键已就绪")
-            except Exception as e:
-                _log(f"on_start 注入横条失败: {e}")
-            # 重放剩余的 JS 依赖操作
-            for action in pending:
-                if action not in ("adjust_opacity_up", "adjust_opacity_down",
-                                  "toggle_click_through"):
-                    _log(f"重放 JS 热键: {action}")
-                    self._dispatch(action)
+
+            # 跳转已移至 _on_loaded，等待深色加载页完全渲染后再跳转
+            _log("on_start 完成（跳转已移至 _on_loaded）")
+
+        # 启动超时保护：20 秒后如果 on_start 还没被调用则提示并退出
+        _start_timeout[0] = threading.Timer(20.0, _on_start_timeout)
+        _start_timeout[0].daemon = True
+        _start_timeout[0].start()
 
         _log("=" * 40)
         _log(f"启动 | 热键：{self.config.get('hotkeys')}")
-        pywebview.start(on_start)
+        try:
+            # private_mode=False + storage_path：修复打包后关闭崩溃（pywebview 5.4 的
+            # clear_user_data 在 private_mode=True 时访问已释放的 CoreWebView2 崩溃），
+            # 同时让 cookies/登录状态持久化、数据目录固定在项目 data。
+            pywebview.start(
+                on_start,
+                private_mode=False,
+                storage_path=_WB2_DATA_DIR,
+            )
+        except Exception as e:
+            # 取消超时定时器（如果有的话）
+            if _start_timeout[0]:
+                _start_timeout[0].cancel()
+            _log(f"WebView2 启动失败: {e}")
+            _messagebox_w("启动失败",
+                f"WebView2 启动时发生错误。\n请确保已安装 WebView2 Runtime。\n\n错误: {e}",
+                MB_OK | MB_ICONERROR | MB_TOPMOST)
+            sys.exit(1)
 
 
 # ====================== JS API（暴露给网页） ======================
@@ -1176,40 +1516,140 @@ class JsApi:
         _action_queue.put("quit")
 
     def trigger_action(self, action_name):
+        if _action_queue.qsize() > 50:
+            return
         if action_name == "show_settings":
             action_name = "open_settings"
         _action_queue.put(action_name)
 
     def navigate(self, url):
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            _log(f"navigate 拒绝非 HTTP URL: {url!r}")
+            return
         _action_queue.put(("navigate", url))
 
 
 # ====================== Tkinter 子线程 ======================
 
+
 def tkinter_thread(app):
     # 初始化 COM 为 STA，与 WebView2 的 COM 线程模型兼容
     COINIT_APARTMENTTHREADED = 2
-    ctypes.windll.ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+    try:
+        ctypes.windll.ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+    except Exception:
+        pass
     root = tk.Tk()
     root.withdraw()
     settings_win = None
+    _last_open_settings = [0.0]  # 防抖：记录上次 open_settings 的时间戳
+
+    # 超时退出按钮：如果窗口长时间未就绪，显示一个退出按钮
+    _timeout_btn = [None]
+    _window_check_count = [0]
 
     def _poll():
         nonlocal settings_win
+
+        # 检测窗口是否长时间未就绪，显示退出按钮
+        if not app._window_ready:
+            _window_check_count[0] += 1
+            # 10 秒后显示退出按钮（25ms * 400 = 10s）
+            if _window_check_count[0] == 400 and _timeout_btn[0] is None:
+                _log("窗口初始化超时，显示退出按钮")
+                try:
+                    # 创建一个小型退出窗口
+                    _timeout_win = tk.Toplevel(root)
+                    _timeout_win.title("跟跑助手 - 等待中")
+                    _timeout_win.geometry("300x100")
+                    _timeout_win.attributes("-topmost", True)
+                    _timeout_win.configure(bg="#1e1e2e")
+                    _timeout_win.protocol("WM_DELETE_WINDOW", lambda: None)  # 禁止关闭
+
+                    tk.Label(_timeout_win, text="窗口初始化中...",
+                             bg="#1e1e2e", fg="#cdd6f4",
+                             font=("微软雅黑", 10)).pack(pady=(15, 10))
+
+                    def _force_exit():
+                        _log("用户点击强制退出按钮")
+                        try:
+                            app._quit()
+                        except:
+                            pass
+                        os._exit(1)
+
+                    _btn = tk.Button(_timeout_win, text="强制退出",
+                                     command=_force_exit,
+                                     bg="#f38ba8", fg="#1e1e2e",
+                                     font=("微软雅黑", 10, "bold"),
+                                     padx=20, pady=5)
+                    _btn.pack(pady=5)
+                    _timeout_btn[0] = _timeout_win
+                except Exception as e:
+                    _logd(f"创建退出按钮失败: {e}")
+
+        # 窗口就绪后关闭退出按钮
+        if app._window_ready and _timeout_btn[0] is not None:
+            try:
+                _timeout_btn[0].destroy()
+            except:
+                pass
+            _timeout_btn[0] = None
+
+        # 检测窗口是否无响应（僵尸状态）
+        if app._window_ready and app._window_alive():
+            try:
+                # 检查窗口是否响应（通过 SendMessage 发送 WM_NULL）
+                hwnd = app._get_hwnd()
+                if hwnd:
+                    # 使用 SendMessageTimeout 检测窗口响应
+                    SMTO_ABORTIFHUNG = 0x0002
+                    result = ctypes.windll.user32.SendMessageTimeoutW(
+                        hwnd, 0x0000, 0, 0, SMTO_ABORTIFHUNG, 1000, None
+                    )
+                    if result == 0:
+                        # 窗口无响应
+                        _log("检测到窗口无响应，可能已卡死")
+                        if _timeout_btn[0] is None:
+                            try:
+                                _timeout_win = tk.Toplevel(root)
+                                _timeout_win.title("跟跑助手 - 无响应")
+                                _timeout_win.geometry("300x100")
+                                _timeout_win.attributes("-topmost", True)
+                                _timeout_win.configure(bg="#1e1e2e")
+                                _timeout_win.protocol("WM_DELETE_WINDOW", lambda: None)
+
+                                tk.Label(_timeout_win, text="窗口无响应",
+                                         bg="#1e1e2e", fg="#f38ba8",
+                                         font=("微软雅黑", 10)).pack(pady=(15, 10))
+
+                                def _force_exit2():
+                                    _log("用户点击强制退出按钮（窗口无响应）")
+                                    os._exit(1)
+
+                                _btn = tk.Button(_timeout_win, text="强制退出",
+                                                 command=_force_exit2,
+                                                 bg="#f38ba8", fg="#1e1e2e",
+                                                 font=("微软雅黑", 10, "bold"),
+                                                 padx=20, pady=5)
+                                _btn.pack(pady=5)
+                                _timeout_btn[0] = _timeout_win
+                            except Exception as e:
+                                _logd(f"创建退出按钮失败: {e}")
+            except Exception as e:
+                _logd(f"检测窗口响应失败: {e}")
+
         # 主动探测 HWND：一旦 pywebview 创建窗口就尝试获取，不等 on_start
         if not app._window_ready and app.window:
             hwnd = app._get_hwnd()
             if hwnd and app._pending_actions:
-                # HWND 已存在但 on_start 还没触发 → 释放非 JS 操作
                 pending_now = []
-                still_pending = []
-                for a in app._pending_actions:
-                    if a in ("adjust_opacity_up", "adjust_opacity_down",
-                             "toggle_click_through"):
-                        pending_now.append(a)
-                    else:
-                        still_pending.append(a)
-                app._pending_actions = still_pending
+                with app._pending_lock:
+                    pending_now = [a for a in app._pending_actions
+                                   if a in ("adjust_opacity_up", "adjust_opacity_down",
+                                            "toggle_click_through")]
+                    app._pending_actions = [a for a in app._pending_actions
+                                            if a not in pending_now]
                 for a in pending_now:
                     _log(f"HWND 就绪，提前执行: {a}")
                     app._dispatch(a)
@@ -1223,6 +1663,12 @@ def tkinter_thread(app):
             processed += 1
             try:
                 if action == "open_settings":
+                    # 防抖：1 秒内重复触发（webview 双击/事件重复派发）直接忽略
+                    _now = time.time()
+                    if _now - _last_open_settings[0] < 1.0:
+                        _logd("设置窗口触发过于频繁，忽略（防抖）")
+                        continue
+                    _last_open_settings[0] = _now
                     if settings_win is not None:
                         try:
                             if settings_win.winfo_exists():
@@ -1231,11 +1677,28 @@ def tkinter_thread(app):
                                 continue
                         except Exception:
                             settings_win = None
+                    # 双路径兜底清理：销毁所有"跟跑助手 · 设置"窗口（保留 keep_win）
+                    # 路径 1: tk 优雅销毁；路径 2: Win32 DestroyWindow 强制销毁
+                    # （tk 状态混乱时 title()/destroy() 抛异常，Win32 路径仍能清理）
+                    _purged = _purge_settings_windows(settings_win, root)
+                    if _purged:
+                        _log(f"已清 {_purged} 个跟跑助手 · 设置 窗口")
+                    if app.is_settings_opened:
+                        _logd("tkinter: 设置窗口已打开，跳过本次创建")
+                        continue
                     app.is_settings_opened = True
-                    settings_win = _build_settings(
-                        root, app,
-                        lambda: _action_queue.put("close_settings")
-                    )
+                    try:
+                        settings_win = _build_settings(
+                            root, app,
+                            lambda: _action_queue.put("close_settings")
+                        )
+                    except Exception as e:
+                        # _build_settings 可能在 widget 创建中途抛异常，但 Toplevel
+                        # 已经创建出来——必须销毁并清状态，避免留下孤儿窗口
+                        _log(f"创建设置窗口失败: {e}")
+                        app.is_settings_opened = False
+                        settings_win = None
+                        raise
                 elif action == "close_settings":
                     app.is_settings_opened = False
                     if settings_win is not None:
@@ -1246,13 +1709,20 @@ def tkinter_thread(app):
                             pass
                         settings_win = None
                 elif action == "quit":
-                    root.quit()
+                    app._quit()
+                    try:
+                        root.quit()
+                    except Exception:
+                        pass
                 elif isinstance(action, tuple) and action[0] == "navigate":
                     app._navigate(action[1])
                 else:
                     app._dispatch(action)
             except Exception as e:
                 _log(f"_poll 处理 action 异常: {e}")
+        # 检查 seek 合并是否到期（在 tkinter 线程执行，避免在 Timer 线程调 evaluate_js）
+        if app._seek_flush_scheduled and time.time() >= app._seek_flush_scheduled:
+            app._flush_seek()
         root.after(25, _poll)
 
     root.after(25, _poll)
@@ -1281,7 +1751,7 @@ class HotkeyRecorder(tk.Frame):
         0x55: "u", 0x56: "v", 0x57: "w", 0x58: "x", 0x59: "y", 0x5A: "z",
         0x70: "f1", 0x71: "f2", 0x72: "f3", 0x73: "f4", 0x74: "f5", 0x75: "f6",
         0x76: "f7", 0x77: "f8", 0x78: "f9", 0x79: "f10", 0x7A: "f11", 0x7B: "f12",
-        0xBD: "-", 0xBB: "=", 0xDB: "[", 0xDD: "]", 0xDC: "\\",
+        0xBD: "-", 0xBB: "=", 0xDB: "[", 0xDD: "]", 0xDC: "\\\\",
         0xBA: ";", 0xDE: "'", 0xBC: ",", 0xBE: ".", 0xBF: "/", 0xC0: "`",
         0x6B: "+", 0x6D: "-",  # numpad +/-
     }
@@ -1310,26 +1780,20 @@ class HotkeyRecorder(tk.Frame):
             self, text="修改", command=self._toggle_record,
             bg="#45475a", fg="#cdd6f4",
             activebackground="#585b70", activeforeground="#cdd6f4",
-            relief="flat", cursor="hand2",
-            font=("微软雅黑", 9), padx=8
+            font=("微软雅黑", 10), cursor="hand2",
+            relief="flat", borderwidth=0, padx=10, pady=2
         )
         self.btn.pack(side="left", padx=(6, 0))
 
-    def set_window_ref(self, window):
-        self._win_ref = window
+    def set_window_ref(self, win):
+        self._win_ref = win
 
     def _key_name(self, key):
-        name = str(key).replace("Key.", "")
+        name = getattr(key, "name", str(key)).lower()
         if name in self.MOD_MAP:
             return self.MOD_MAP[name]
         try:
-            if key.char:
-                # 检测小键盘键（通过 vk 判断）
-                if hasattr(key, "vk") and key.vk is not None:
-                    nk = self._numpad_map.get(key.vk)
-                    if nk:
-                        return nk
-                return key.char.lower()
+            vk = getattr(key, "vk", None)
         except AttributeError:
             pass
         if hasattr(key, "vk") and key.vk is not None:
@@ -1339,7 +1803,6 @@ class HotkeyRecorder(tk.Frame):
             return self.VK_MAP.get(key.vk, f"vk{key.vk}")
         return name.lower()
 
-    # 小键盘 VK → 配置名映射（避免 ↔ 字母区同名键混淆）
     _numpad_map = {
         0x60: "numpad_0", 0x61: "numpad_1", 0x62: "numpad_2", 0x63: "numpad_3",
         0x64: "numpad_4", 0x65: "numpad_5", 0x66: "numpad_6", 0x67: "numpad_7",
@@ -1454,8 +1917,90 @@ class HotkeyRecorder(tk.Frame):
 
 # ====================== 设置窗口 ======================
 
+def _purge_settings_windows(keep_win, tk_root, title="跟跑助手 · 设置"):
+    """销毁所有名为 title 的设置窗口（保留 keep_win）。
+
+    双路径兜底：
+    1) tk 路径：遍历 root.winfo_children() 里的 Toplevel，destroy() 优雅销毁
+    2) Win32 路径：EnumWindows 找本进程同标题可见窗口，DestroyWindow 强制销毁
+    （tk 状态混乱导致 title()/destroy() 抛异常时，路径 2 仍能兜底清理）
+    """
+    purged = 0
+    keep_hwnd = 0
+    if keep_win is not None:
+        try:
+            keep_hwnd = keep_win.winfo_id()
+        except Exception:
+            keep_hwnd = 0
+    # 路径 1：tk 优雅销毁
+    try:
+        children = list(tk_root.winfo_children())
+    except Exception:
+        children = []
+    for w in children:
+        try:
+            if not isinstance(w, tk.Toplevel) or w is keep_win:
+                continue
+        except Exception:
+            continue
+        try:
+            if not w.winfo_exists() or w.title() != title:
+                continue
+        except Exception:
+            continue
+        try:
+            w.destroy()
+            purged += 1
+        except Exception:
+            pass
+    # 路径 2：Win32 强制销毁（本进程内、同标题、可见窗口）
+    try:
+        my_pid = ctypes.windll.kernel32.GetCurrentProcessId()
+        hwnds = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+        def _cb(hwnd, _):
+            pid = ctypes.wintypes.DWORD()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value != my_pid or not ctypes.windll.user32.IsWindowVisible(hwnd):
+                return True
+            buf = ctypes.create_unicode_buffer(256)
+            ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
+            if buf.value == title:
+                hwnds.append(hwnd)
+            return True
+
+        ctypes.windll.user32.EnumWindows(_cb, 0)
+        for h in hwnds:
+            if h == keep_hwnd:
+                continue
+            try:
+                if ctypes.windll.user32.IsWindow(h):
+                    ctypes.windll.user32.DestroyWindow(h)
+                    purged += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return purged
+
+
 def _build_settings(tk_root, app, on_close_callback):
     win = tk.Toplevel(tk_root)
+    try:
+        _populate_settings(win, tk_root, app, on_close_callback)
+    except Exception:
+        # widget 构建中途失败：销毁半成品 Toplevel，避免留下空白孤儿窗口
+        # —— 下次再点设置就不会出现"一个完整 + 一个空白"的脏状态
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        raise
+    return win
+
+
+def _populate_settings(win, tk_root, app, on_close_callback):
     win.title("跟跑助手 · 设置")
     win.resizable(False, False)
     win.attributes("-topmost", True)
@@ -1530,6 +2075,7 @@ def _build_settings(tk_root, app, on_close_callback):
 
     var_show_bar  = tk.BooleanVar(value=app.config.get("show_top_bar", True))
     var_auto_hide = tk.BooleanVar(value=app.config.get("top_bar_auto_hide", True))
+    var_lock_ratio = tk.BooleanVar(value=app.config.get("lock_aspect_ratio", True))
 
     def _chk(parent, text, v):
         return tk.Checkbutton(
@@ -1543,8 +2089,16 @@ def _build_settings(tk_root, app, on_close_callback):
         row=sep_row + 1, column=0, columnspan=2, sticky="w", pady=2)
     _chk(tab_gen, "自动隐藏快捷栏（鼠标离开 3 秒后）", var_auto_hide).grid(
         row=sep_row + 2, column=0, columnspan=2, sticky="w", pady=2)
-    gen_vars["show_top_bar"]       = var_show_bar
-    gen_vars["top_bar_auto_hide"] = var_auto_hide
+    _chk(tab_gen, "锁定窗口比例 16:9（拖动窗口大小时保持宽屏）", var_lock_ratio).grid(
+        row=sep_row + 3, column=0, columnspan=2, sticky="w", pady=2)
+    ttk.Label(tab_gen,
+        text="关闭后可自由拉伸窗口大小",
+        foreground="#6c7086", background="#1e1e2e",
+        font=("微软雅黑", 9)
+    ).grid(row=sep_row + 4, column=0, columnspan=2, sticky="w", padx=(22, 0), pady=(0, 4))
+    gen_vars["show_top_bar"]        = var_show_bar
+    gen_vars["top_bar_auto_hide"]   = var_auto_hide
+    gen_vars["lock_aspect_ratio"]   = var_lock_ratio
 
     # 热键
     ttk.Label(tab_hk, text="热键绑定", style="Head.TLabel").grid(
@@ -1624,6 +2178,7 @@ def _save_settings(win, gen_vars, hk_recorders, app, on_close_callback):
         "width":          width,
         "height":         height,
         "window_state":   app.config.get("window_state"),
+        "lock_aspect_ratio": bool(gen_vars["lock_aspect_ratio"].get()),
         "opacity_levels": opacity_levels,
         "show_top_bar":      bool(gen_vars["show_top_bar"].get()),
         "top_bar_auto_hide":  bool(gen_vars["top_bar_auto_hide"].get()),
@@ -1657,6 +2212,22 @@ def _build_hotkey_manager(app):
 # ====================== 主入口 ======================
 
 if __name__ == "__main__":
+    # 安装全局未捕获异常处理器（用日志 + MessageBoxW，不碰 tkinter）
+    def _global_excepthook(exc_type, exc_value, exc_traceback):
+        import traceback
+        err_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        try:
+            _log(f"未捕获异常: {err_msg}")
+        except Exception:
+            pass
+        try:
+            _messagebox_w("程序异常",
+                f"跟跑助手遇到未捕获的异常:\\n\\n{exc_value}\\n\\n请查看 debug.log 获取详情。",
+                MB_OK | MB_ICONERROR | MB_TOPMOST)
+        except Exception:
+            pass
+    sys.excepthook = _global_excepthook
+
     def is_admin():
         try:
             return ctypes.windll.shell32.IsUserAnAdmin()
@@ -1664,15 +2235,31 @@ if __name__ == "__main__":
             return False
 
     if not is_admin():
-        r = tk.Tk()
-        r.withdraw()
-        if messagebox.askyesno("权限", "建议管理员运行，热键更稳定"):
-            ctypes.windll.shell32.ShellExecuteW(
+        ret = _messagebox_w("权限", "建议管理员运行，热键更稳定。是否以管理员身份重新启动？",
+                           MB_YESNO | MB_ICONQUESTION | MB_TOPMOST)
+        if ret == 6:  # IDYES
+            result = ctypes.windll.shell32.ShellExecuteW(
                 None, "runas", sys.executable, subprocess.list2cmdline(sys.argv[1:]), None, 1
             )
-            r.destroy()
-            sys.exit()
-        r.destroy()
+            if result <= 32:  # ShellExecuteW 失败（如用户取消UAC、组策略阻止等）
+                _log(f"管理员提权未成功（返回值 {result}），继续以当前权限运行")
+            else:
+                sys.exit()
+
+    # 全局互斥锁：使用系统级 Mutex 精准判断程序是否真正在运行
+    # 崩溃的进程会自动释放内核对象，不会导致新实例误判
+    _app_mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "GenpaoBrowser_Mutex_Unique")
+    _last_error = ctypes.windll.kernel32.GetLastError()
+
+    # ERROR_ALREADY_EXISTS = 183，说明已有实例在运行
+    if _last_error == 183:
+        _log("检测到已有实例在运行，退出")
+        _messagebox_w("已运行", "跟跑助手已在运行中，不能同时打开多个实例。",
+                      MB_OK | MB_ICONWARNING | MB_TOPMOST)
+        sys.exit(0)
+
+    # 必须保持对 mutex 的引用，防止被 Python 垃圾回收机制销毁
+    _ = _app_mutex
 
     app = BrowserApp()
 

@@ -5,6 +5,17 @@
 当前版本：**V1.0.6**  
 更新日期：**2026-09-18**
 
+## 下载
+
+Release 页面：<https://github.com/duojiaxiangcai778/genpao-browser/releases/latest>
+
+| 文件 | 说明 |
+|---|---|
+| `genpao-assistant-v1.0.6.exe` | 主程序，双击运行（本地原始文件名 `跟跑助手.exe`） |
+| `genpao-browser-v1.0.6-release.zip` | 正式版完整包，解压即用，内附 `操作说明.txt` |
+
+> GitHub 的 Release 附件名不支持中文字符，因此上传时使用英文文件名，内容与本地发布包完全一致。
+
 ## 功能
 
 - 全局热键控制播放/暂停、快进/快退、倍速、透明度。
